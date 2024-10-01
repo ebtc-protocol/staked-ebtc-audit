@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-pragma solidity ^0.8.21;
+pragma solidity 0.8.25;
 
 // ====================================================================
 // |     ______                   _______                             |
@@ -13,19 +13,33 @@ pragma solidity ^0.8.21;
 // ====================================================================
 // Frax Finance: https://github.com/FraxFinance
 
-import { ERC20, ERC4626 } from "solmate/mixins/ERC4626.sol";
-import { SafeCastLib } from "solmate/utils/SafeCastLib.sol";
+import { ERC20, ERC4626 } from "@solmate/tokens/ERC4626.sol";
+import { SafeCastLib } from "@solmate/utils/SafeCastLib.sol";
+import { SafeTransferLib } from "@solmate/utils/SafeTransferLib.sol";
 
 /// @title LinearRewardsErc4626
 /// @notice An ERC4626 Vault implementation with linear rewards
 abstract contract LinearRewardsErc4626 is ERC4626 {
     using SafeCastLib for *;
+    using SafeTransferLib for ERC20;
+
+    event SetMinRewardsPerPeriod(uint256 oldMinRewards, uint256 newMinRewards);
+
+    event SetMintingFee(uint256 oldMintingFee, uint256 newMintingFee);
+
+    event FeeTaken(address indexed recipient, uint256 feeAmount);
+
+    /// @notice Fee precision, 1e8 = 100%
+    uint256 public constant FEE_PRECISION = 1e8;
 
     /// @notice The precision of all integer calculations
     uint256 public constant PRECISION = 1e18;
 
     /// @notice The rewards cycle length in seconds
     uint256 public immutable REWARDS_CYCLE_LENGTH;
+
+    /// @notice Fee recipient address
+    address public immutable FEE_RECIPIENT;
 
     /// @notice Information about the current rewards cycle
     struct RewardsCycleData {
@@ -35,6 +49,8 @@ abstract contract LinearRewardsErc4626 is ERC4626 {
     }
 
     /// @notice The rewards cycle data, stored in a single word to save gas
+    /// @notice calculateRewardsToDistribute should be used to get rewardCycleAmount
+    /// because of maxDistributionPerSecondPerAsset
     RewardsCycleData public rewardsCycleData;
 
     /// @notice The timestamp of the last time rewards were distributed
@@ -42,6 +58,15 @@ abstract contract LinearRewardsErc4626 is ERC4626 {
 
     /// @notice The total amount of assets that have been distributed and deposited
     uint256 public storedTotalAssets;
+
+    /// @notice The total amount of assets including recent donations
+    uint256 public totalBalance;
+
+    /// @notice The minimum amount of rewards required start the next rewards cycle
+    uint256 public minRewardsPerPeriod;
+
+    /// @notice The amount of minting fee in FEE_PRECISION
+    uint256 public mintingFee;
 
     /// @notice The precision of the underlying asset
     uint256 public immutable UNDERLYING_PRECISION;
@@ -54,10 +79,14 @@ abstract contract LinearRewardsErc4626 is ERC4626 {
         ERC20 _underlying,
         string memory _name,
         string memory _symbol,
-        uint256 _rewardsCycleLength
+        uint256 _rewardsCycleLength,
+        address _feeRecipient
     ) ERC4626(_underlying, _name, _symbol) {
+        require(_feeRecipient != address(0));
+
         REWARDS_CYCLE_LENGTH = _rewardsCycleLength;
         UNDERLYING_PRECISION = 10 ** _underlying.decimals();
+        FEE_RECIPIENT = _feeRecipient;
 
         // initialize rewardsCycleEnd value
         // NOTE: normally distribution of rewards should be done prior to _syncRewards but in this case we know there are no users or rewards yet.
@@ -65,6 +94,17 @@ abstract contract LinearRewardsErc4626 is ERC4626 {
 
         // initialize lastRewardsDistribution value
         _distributeRewards();
+    }
+
+    function _setMinRewardsPerPeriod(uint256 _minRewards) internal {
+        emit SetMinRewardsPerPeriod(minRewardsPerPeriod, _minRewards);
+        minRewardsPerPeriod = _minRewards;
+    }
+
+    function _setMintingFee(uint256 _mintingFee) internal {
+        require(_mintingFee <= FEE_PRECISION);
+        emit SetMintingFee(mintingFee, _mintingFee);
+        mintingFee = _mintingFee;
     }
 
     function pricePerShare() external view returns (uint256 _pricePerShare) {
@@ -129,7 +169,9 @@ abstract contract LinearRewardsErc4626 is ERC4626 {
         if (_timestamp <= _rewardsCycleData.cycleEnd) return _rewardsCycleData;
 
         // Calculate rewards for next cycle
-        uint256 _newRewards = asset.balanceOf(address(this)) - storedTotalAssets;
+        uint256 _newRewards = totalBalance - storedTotalAssets;
+
+        require(_newRewards >= minRewardsPerPeriod, "min rewards");
 
         // Calculate the next cycle end, this keeps cycles at the same time regardless of when sync is called
         uint40 _cycleEnd = (((_timestamp + REWARDS_CYCLE_LENGTH) / REWARDS_CYCLE_LENGTH) * REWARDS_CYCLE_LENGTH)
@@ -187,15 +229,55 @@ abstract contract LinearRewardsErc4626 is ERC4626 {
 
     function afterDeposit(uint256 amount, uint256 shares) internal virtual override {
         storedTotalAssets += amount;
+        totalBalance += amount;
     }
 
+    function _computeFeeRaw(uint256 _assets) private view returns (uint256) {
+        return _assets * mintingFee / FEE_PRECISION;
+    }
+
+    function _computeFeeTotal(uint256 _assets) private view returns (uint256) {
+        return (_assets * mintingFee) / (mintingFee + FEE_PRECISION);
+    }
+
+    function _takeFee(uint256 _feeAmount) private {
+        if (_feeAmount > 0) {
+            asset.safeTransferFrom(msg.sender, FEE_RECIPIENT, _feeAmount);
+            emit FeeTaken(FEE_RECIPIENT, _feeAmount);
+        }
+    }
+
+    function previewDeposit(uint256 _assets) public view override returns (uint256) {
+        uint256 feeAmount = _computeFeeTotal(_assets);
+        return super.previewDeposit(_assets - feeAmount);
+    }
+    
     /// @notice The ```deposit``` function allows a user to mint shares by depositing underlying
     /// @param _assets The amount of underlying to deposit
     /// @param _receiver The address to send the shares to
     /// @return _shares The amount of shares minted
     function deposit(uint256 _assets, address _receiver) public override returns (uint256 _shares) {
         syncRewardsAndDistribution();
-        _shares = super.deposit({ assets: _assets, receiver: _receiver });
+
+        uint256 feeAmount = _computeFeeTotal(_assets);
+
+        uint256 assetsNoFee = _assets - feeAmount;
+
+        // Check for rounding error since we round down in previewDeposit.
+        /// @dev calling super.previewDeposit to ignore feeBPS
+        require((_shares = super.previewDeposit(assetsNoFee)) != 0, "ZERO_SHARES");
+
+        // Need to transfer before minting or ERC777s could reenter.
+        asset.safeTransferFrom(msg.sender, address(this), assetsNoFee);
+
+        _mint(_receiver, _shares);
+
+        // Emit _assets transferred from sender including fees
+        emit Deposit(msg.sender, _receiver, _assets, _shares);
+
+        afterDeposit(assetsNoFee, _shares);
+
+        _takeFee(feeAmount);
     }
 
     /// @notice The ```mint``` function allows a user to mint a given number of shares
@@ -204,11 +286,35 @@ abstract contract LinearRewardsErc4626 is ERC4626 {
     /// @return _assets The amount of underlying deposited
     function mint(uint256 _shares, address _receiver) public override returns (uint256 _assets) {
         syncRewardsAndDistribution();
-        _assets = super.mint({ shares: _shares, receiver: _receiver });
+
+        /// @dev calling super.previewMint to ignore feeBPS
+        uint256 assetsNoFee = super.previewMint(_shares); // No need to check for rounding error, previewMint rounds up.
+
+        // Need to transfer before minting or ERC777s could reenter.
+        asset.safeTransferFrom(msg.sender, address(this), assetsNoFee);
+
+        _mint(_receiver, _shares);
+
+        uint256 feeAmount = _computeFeeRaw(assetsNoFee);
+
+        /// @dev return _assets + feeAmount
+        _assets = assetsNoFee + feeAmount;
+
+        emit Deposit(msg.sender, _receiver, _assets, _shares);
+
+        afterDeposit(assetsNoFee, _shares);
+
+        _takeFee(feeAmount);
+    }
+
+    function previewMint(uint256 shares) public view override returns (uint256) {
+        uint256 assets = super.previewMint(shares);
+        return assets + _computeFeeRaw(assets);
     }
 
     function beforeWithdraw(uint256 amount, uint256 shares) internal virtual override {
         storedTotalAssets -= amount;
+        totalBalance -= amount;
     }
 
     /// @notice The ```withdraw``` function allows a user to withdraw a given amount of underlying
@@ -252,15 +358,20 @@ abstract contract LinearRewardsErc4626 is ERC4626 {
         bytes32 _s
     ) external returns (uint256 _shares) {
         uint256 _amount = _approveMax ? type(uint256).max : _assets;
-        asset.permit({
-            owner: msg.sender,
-            spender: address(this),
-            value: _amount,
-            deadline: _deadline,
-            v: _v,
-            r: _r,
-            s: _s
-        });
+        try 
+            asset.permit({
+                owner: msg.sender,
+                spender: address(this),
+                value: _amount,
+                deadline: _deadline,
+                v: _v,
+                r: _r,
+                s: _s
+            }) 
+        { } catch {
+            /// @notice adding try...catch around to mitigate potential permit front-running
+            /// see: https://www.trust-security.xyz/post/permission-denied
+        }
         _shares = (deposit({ _assets: _assets, _receiver: _receiver }));
     }
 
